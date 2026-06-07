@@ -88,3 +88,45 @@ class BookDetailResponse(BaseModel):
     created_at: datetime
     characters: list[CharacterResponse]
     chapters: list[ChapterResponse]
+
+
+class VoicepackInboxItem(BaseModel):
+    filename: str
+    size_bytes: int
+    modified_at: datetime
+    package_id: str | None = None
+    character_name: str | None = None
+    voice_name: str | None = None
+    engine: str | None = None
+    is_valid: bool
+    error: str | None = None
+
+
+class VoicepackImportRequest(BaseModel):
+    filename: str = Field(min_length=1, max_length=260)
+
+
+class VoicepackSummary(BaseModel):
+    package_id: str
+    character_name: str
+    voice_name: str
+    engine: str
+    supported_emotions: list[str]
+    imported_at: datetime | None = None
+    source_filename: str | None = None
+    preview_urls: list[str]
+
+
+class VoicepackDetail(VoicepackSummary):
+    description: str
+    manifest: dict
+
+
+class VoicepackTestRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=1000)
+    emotion: str | None = None
+
+
+class VoicepackTestResponse(BaseModel):
+    status: str
+    detail: str

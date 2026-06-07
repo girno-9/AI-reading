@@ -2,26 +2,23 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   BookOpen,
-  CheckCircle2,
   Download,
-  FileAudio,
   FileJson,
   Mic2,
-  Plus,
+  PackageOpen,
+  RefreshCw,
+  Sparkles,
   Trash2,
   Upload,
-  Volume2,
 } from 'lucide-react';
 import './phase3.css';
 
+const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8000';
 const STORAGE_KEY = 'ai-reading-phase3-workspace-v1';
-const AUDIO_EXTENSIONS = ['wav', 'mp3', 'm4a', 'flac', 'ogg'];
-const AUDIO_TYPES = ['audio/wav', 'audio/x-wav', 'audio/mpeg', 'audio/mp3', 'audio/mp4', 'audio/x-m4a', 'audio/flac', 'audio/ogg'];
 
 function emptyWorkspace() {
   return {
     sourceBook: null,
-    voices: [],
     characterVoiceMap: {},
     segmentVoiceMap: {},
     importedAt: '',
@@ -32,9 +29,9 @@ function emptyWorkspace() {
 function App() {
   const [workspace, setWorkspace] = useState(loadWorkspace);
   const [status, setStatus] = useState('导入 1-2 阶段整本 JSON 后开始分配声音');
-  const [voiceName, setVoiceName] = useState('');
-  const [voiceNote, setVoiceNote] = useState('');
-  const [voiceFile, setVoiceFile] = useState(null);
+  const [voicepackInbox, setVoicepackInbox] = useState([]);
+  const [voicepacks, setVoicepacks] = useState([]);
+  const [isLoadingVoicepacks, setIsLoadingVoicepacks] = useState(false);
   const [activeChapterId, setActiveChapterId] = useState(null);
   const importInputRef = useRef(null);
 
@@ -48,6 +45,10 @@ function App() {
   const segmentCount = chapters.reduce((total, chapter) => total + (chapter.segments?.length || 0), 0);
   const assignedCharacters = characters.filter((character) => workspace.characterVoiceMap[getCharacterKey(character)]);
   const overrideCount = Object.keys(workspace.segmentVoiceMap).length;
+
+  useEffect(() => {
+    refreshVoicepacks();
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(workspace));
@@ -76,91 +77,104 @@ function App() {
     }
   }
 
-  async function addVoice(event) {
-    event.preventDefault();
-    const cleanName = voiceName.trim();
-    if (!cleanName) {
-      setStatus('请填写声音名称');
-      return;
-    }
-    if (!voiceFile) {
-      setStatus('请选择声音样本文件');
-      return;
-    }
+  async function api(path, options = {}) {
     try {
-      validateAudioFile(voiceFile);
-      const dataUrl = await fileToDataUrl(voiceFile);
-      const now = new Date().toISOString();
-      const voice = {
-        id: createLocalId('voice'),
-        name: cleanName,
-        note: voiceNote.trim(),
-        sample_filename: voiceFile.name,
-        sample_type: voiceFile.type || guessAudioType(voiceFile.name),
-        sample_data_url: dataUrl,
-        created_at: now,
-      };
-      setWorkspace((current) => touch({ ...current, voices: [...current.voices, voice] }));
-      setVoiceName('');
-      setVoiceNote('');
-      setVoiceFile(null);
-      setStatus(`已添加声音：${voice.name}`);
+      const response = await fetch(`${API_BASE}${path}`, {
+        headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+        ...options,
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({ detail: '请求失败，请查看后端 CMD 窗口。' }));
+        throw new Error(error.detail || '请求失败，请查看后端 CMD 窗口。');
+      }
+      return response.json();
+    } catch (error) {
+      if (error instanceof TypeError) {
+        throw new Error(`无法连接后端：${API_BASE}。请确认后端 CMD 窗口正在运行。`);
+      }
+      throw error;
+    }
+  }
+
+  async function refreshVoicepacks() {
+    setIsLoadingVoicepacks(true);
+    try {
+      const [inbox, imported] = await Promise.all([api('/api/voicepacks/inbox'), api('/api/voicepacks')]);
+      setVoicepackInbox(inbox);
+      setVoicepacks(imported);
+      setStatus(`声音包库已刷新：投递区 ${inbox.length} 个，已导入 ${imported.length} 个`);
+    } catch (error) {
+      setStatus(error.message);
+    } finally {
+      setIsLoadingVoicepacks(false);
+    }
+  }
+
+  async function importVoicepack(filename) {
+    try {
+      setStatus(`正在导入声音包：${filename}`);
+      const detail = await api('/api/voicepacks/import', {
+        method: 'POST',
+        body: JSON.stringify({ filename }),
+      });
+      await refreshVoicepacks();
+      setStatus(`已导入声音包：${detail.voice_name}`);
     } catch (error) {
       setStatus(error.message);
     }
   }
 
-  function renameVoice(voiceId, nextName) {
-    const cleanName = nextName.trim();
-    if (!cleanName) return;
-    setWorkspace((current) =>
-      touch({
-        ...current,
-        voices: current.voices.map((voice) => (voice.id === voiceId ? { ...voice, name: cleanName } : voice)),
-      }),
-    );
-    setStatus('声音名称已更新');
-  }
-
-  function updateVoiceNote(voiceId, note) {
-    setWorkspace((current) =>
-      touch({
-        ...current,
-        voices: current.voices.map((voice) => (voice.id === voiceId ? { ...voice, note } : voice)),
-      }),
-    );
-  }
-
-  function deleteVoice(voiceId) {
-    const voice = workspace.voices.find((item) => item.id === voiceId);
-    const confirmed = window.confirm(`删除声音“${voice?.name || ''}”吗？相关角色默认声音和段落覆盖会被清空。`);
+  async function deleteVoicepack(packageId) {
+    const voicepack = voicepacks.find((item) => item.package_id === packageId);
+    const confirmed = window.confirm(`删除已导入声音包“${voicepack?.voice_name || ''}”吗？投递区原 ZIP 不会删除。`);
     if (!confirmed) return;
-    setWorkspace((current) =>
-      touch({
-        ...current,
-        voices: current.voices.filter((item) => item.id !== voiceId),
-        characterVoiceMap: removeVoiceAssignments(current.characterVoiceMap, voiceId),
-        segmentVoiceMap: removeVoiceAssignments(current.segmentVoiceMap, voiceId),
-      }),
-    );
-    setStatus('声音已删除，相关分配已清空');
+    try {
+      await api(`/api/voicepacks/${packageId}`, { method: 'DELETE' });
+      setWorkspace((current) =>
+        touch({
+          ...current,
+          characterVoiceMap: removeVoiceAssignments(current.characterVoiceMap, packageId),
+          segmentVoiceMap: removeVoiceAssignments(current.segmentVoiceMap, packageId),
+        }),
+      );
+      await refreshVoicepacks();
+      setStatus('已删除导入副本，相关分配已清空');
+    } catch (error) {
+      setStatus(error.message);
+    }
   }
 
-  function setCharacterVoice(character, voiceId) {
+  async function testVoicepack(segment, packageId) {
+    if (!packageId) {
+      setStatus('当前段落还没有生效声音包');
+      return;
+    }
+    try {
+      const result = await api(`/api/voicepacks/${packageId}/test-synthesis`, {
+        method: 'POST',
+        body: JSON.stringify({ text: segment.text, emotion: segment.label || null }),
+      });
+      setStatus(result.detail || '试听测试完成');
+    } catch (error) {
+      setStatus(error.message);
+    }
+  }
+
+  function setCharacterVoice(character, packageId) {
     const key = getCharacterKey(character);
     setWorkspace((current) => {
       const characterVoiceMap = { ...current.characterVoiceMap };
-      if (voiceId) characterVoiceMap[key] = voiceId;
+      if (packageId) characterVoiceMap[key] = packageId;
       else delete characterVoiceMap[key];
       return touch({ ...current, characterVoiceMap });
     });
   }
 
-  function setSegmentVoice(segment, voiceId) {
+  function setSegmentVoice(segment, packageId) {
     const key = getSegmentKey(segment);
     setWorkspace((current) => {
       const segmentVoiceMap = { ...current.segmentVoiceMap };
-      if (voiceId) segmentVoiceMap[key] = voiceId;
+      if (packageId) segmentVoiceMap[key] = packageId;
       else delete segmentVoiceMap[key];
       return touch({ ...current, segmentVoiceMap });
     });
@@ -180,7 +194,7 @@ function App() {
       setStatus('请先导入 1-2 阶段整本 JSON');
       return;
     }
-    const payload = buildPhase3Export(workspace);
+    const payload = buildPhase3Export(workspace, voicepacks);
     downloadJson(payload, `${sanitizeFilename(payload.title)}_phase3_voice_assignment.json`);
     setStatus('已导出第三阶段 JSON');
   }
@@ -227,8 +241,8 @@ function App() {
 
         <section className="stats-panel">
           <div>
-            <strong>{workspace.voices.length}</strong>
-            <span>声音</span>
+            <strong>{voicepacks.length}</strong>
+            <span>声音包</span>
           </div>
           <div>
             <strong>{assignedCharacters.length}</strong>
@@ -271,31 +285,17 @@ function App() {
           <div className="phase3-grid">
             <section className="voice-library">
               <header>
-                <h2>声音库</h2>
-                <span>样本会写入导出文件</span>
+                <h2>ZIP 声音包库</h2>
+                <span>投递区自动识别</span>
               </header>
-              <form className="voice-form" onSubmit={addVoice}>
-                <input value={voiceName} onChange={(event) => setVoiceName(event.target.value)} placeholder="声音名称，例如：温柔女声" />
-                <input value={voiceNote} onChange={(event) => setVoiceNote(event.target.value)} placeholder="备注，例如：旁白 / 慢速 / 清亮" />
-                <label className="file-picker">
-                  <FileAudio size={17} />
-                  <span>{voiceFile ? voiceFile.name : '选择 wav / mp3 / m4a / flac / ogg'}</span>
-                  <input type="file" accept=".wav,.mp3,.m4a,.flac,.ogg,audio/*" onChange={(event) => setVoiceFile(event.target.files?.[0] || null)} />
-                </label>
-                <button type="submit">
-                  <Plus size={17} />
-                  添加声音
-                </button>
-              </form>
-              <div className="voice-list">
-                {workspace.voices.length === 0 ? (
-                  <p className="muted">还没有声音样本</p>
-                ) : (
-                  workspace.voices.map((voice) => (
-                    <VoiceRow key={voice.id} voice={voice} onRename={renameVoice} onNoteChange={updateVoiceNote} onDelete={deleteVoice} />
-                  ))
-                )}
-              </div>
+              <VoicepackLibrary
+                inbox={voicepackInbox}
+                voicepacks={voicepacks}
+                isLoading={isLoadingVoicepacks}
+                onRefresh={refreshVoicepacks}
+                onImport={importVoicepack}
+                onDelete={deleteVoicepack}
+              />
             </section>
 
             <section className="character-voices">
@@ -311,9 +311,9 @@ function App() {
                       <span title={character.name}>{character.name}</span>
                       <select value={workspace.characterVoiceMap[key] || ''} onChange={(event) => setCharacterVoice(character, event.target.value)}>
                         <option value="">未分配</option>
-                        {workspace.voices.map((voice) => (
-                          <option key={voice.id} value={voice.id}>
-                            {voice.name}
+                        {voicepacks.map((voicepack) => (
+                          <option key={voicepack.package_id} value={voicepack.package_id}>
+                            {voicepack.voice_name}
                           </option>
                         ))}
                       </select>
@@ -341,10 +341,11 @@ function App() {
                   <SegmentVoiceRow
                     key={getSegmentKey(segment)}
                     segment={segment}
-                    voices={workspace.voices}
+                    voicepacks={voicepacks}
                     characterVoiceMap={workspace.characterVoiceMap}
                     segmentVoiceMap={workspace.segmentVoiceMap}
                     onChange={setSegmentVoice}
+                    onTest={testVoicepack}
                   />
                 ))}
               </div>
@@ -356,34 +357,64 @@ function App() {
   );
 }
 
-function VoiceRow({ voice, onRename, onNoteChange, onDelete }) {
-  const [name, setName] = useState(voice.name);
-
-  useEffect(() => {
-    setName(voice.name);
-  }, [voice.name]);
-
+function VoicepackLibrary({ inbox, voicepacks, isLoading, onRefresh, onImport, onDelete }) {
   return (
-    <article className="voice-row">
-      <div className="voice-icon">
-        <Volume2 size={18} />
-      </div>
-      <div className="voice-fields">
-        <div className="voice-name-line">
-          <input value={name} onChange={(event) => setName(event.target.value)} />
-          <button disabled={name.trim() === voice.name} onClick={() => onRename(voice.id, name)}>
-            <CheckCircle2 size={15} />
-            保存
-          </button>
-        </div>
-        <input value={voice.note || ''} onChange={(event) => onNoteChange(voice.id, event.target.value)} placeholder="备注" />
-        <small>{voice.sample_filename}</small>
-        <audio controls src={voice.sample_data_url} />
-      </div>
-      <button className="icon-danger" onClick={() => onDelete(voice.id)} title="删除声音">
-        <Trash2 size={16} />
+    <div className="voicepack-library">
+      <button onClick={onRefresh} disabled={isLoading}>
+        <RefreshCw size={17} />
+        {isLoading ? '正在刷新...' : '刷新投递区'}
       </button>
-    </article>
+      <div className="voicepack-path">
+        <PackageOpen size={17} />
+        <span>backend\\data\\voicepack_inbox</span>
+      </div>
+
+      <section className="voicepack-section">
+        <h3>投递区 ZIP</h3>
+        <div className="voice-list">
+          {inbox.length === 0 ? (
+            <p className="muted">把 .voicepack.zip 放进投递区后点击刷新</p>
+          ) : (
+            inbox.map((item) => (
+              <article className={`voicepack-row ${item.is_valid ? '' : 'invalid'}`} key={item.filename}>
+                <div className="voicepack-info">
+                  <strong>{item.voice_name || item.filename}</strong>
+                  <small>{item.is_valid ? `${item.character_name || '未命名角色'} / ${item.engine || '未知引擎'}` : item.error}</small>
+                  <small>{item.filename}</small>
+                </div>
+                <button disabled={!item.is_valid} onClick={() => onImport(item.filename)}>
+                  <Upload size={16} />
+                  导入
+                </button>
+              </article>
+            ))
+          )}
+        </div>
+      </section>
+
+      <section className="voicepack-section">
+        <h3>已导入</h3>
+        <div className="voice-list">
+          {voicepacks.length === 0 ? (
+            <p className="muted">还没有导入声音包</p>
+          ) : (
+            voicepacks.map((voicepack) => (
+              <article className="voicepack-row imported" key={voicepack.package_id}>
+                <div className="voicepack-info">
+                  <strong>{voicepack.voice_name}</strong>
+                  <small>{voicepack.character_name} / {voicepack.engine || '未知引擎'}</small>
+                  <small>{voicepack.supported_emotions?.length ? voicepack.supported_emotions.join('、') : '未声明情绪'}</small>
+                  {voicepack.preview_urls?.[0] && <audio controls src={`${API_BASE}${voicepack.preview_urls[0]}`} />}
+                </div>
+                <button className="icon-danger" onClick={() => onDelete(voicepack.package_id)} title="删除导入副本">
+                  <Trash2 size={16} />
+                </button>
+              </article>
+            ))
+          )}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -402,13 +433,13 @@ function IllustrationStrip({ chapter }) {
   );
 }
 
-function SegmentVoiceRow({ segment, voices, characterVoiceMap, segmentVoiceMap, onChange }) {
+function SegmentVoiceRow({ segment, voicepacks, characterVoiceMap, segmentVoiceMap, onChange, onTest }) {
   const segmentKey = getSegmentKey(segment);
   const characterKey = String(segment.character_id || segment.character_name || '');
-  const overrideVoiceId = segmentVoiceMap[segmentKey] || '';
-  const inheritedVoiceId = characterVoiceMap[characterKey] || '';
-  const effectiveVoiceId = overrideVoiceId || inheritedVoiceId;
-  const effectiveVoice = voices.find((voice) => voice.id === effectiveVoiceId);
+  const overridePackageId = segmentVoiceMap[segmentKey] || '';
+  const inheritedPackageId = characterVoiceMap[characterKey] || '';
+  const effectivePackageId = overridePackageId || inheritedPackageId;
+  const effectiveVoicepack = voicepacks.find((voicepack) => voicepack.package_id === effectivePackageId);
 
   return (
     <article className="segment-voice-row">
@@ -422,15 +453,19 @@ function SegmentVoiceRow({ segment, voices, characterVoiceMap, segmentVoiceMap, 
         <p>{segment.text}</p>
       </div>
       <div className="segment-voice-select">
-        <select value={overrideVoiceId} onChange={(event) => onChange(segment, event.target.value)}>
-          <option value="">继承角色声音</option>
-          {voices.map((voice) => (
-            <option key={voice.id} value={voice.id}>
-              {voice.name}
+        <select value={overridePackageId} onChange={(event) => onChange(segment, event.target.value)}>
+          <option value="">继承角色声音包</option>
+          {voicepacks.map((voicepack) => (
+            <option key={voicepack.package_id} value={voicepack.package_id}>
+              {voicepack.voice_name}
             </option>
           ))}
         </select>
-        <small>{effectiveVoice ? `生效：${effectiveVoice.name}` : '生效：未分配'}</small>
+        <small>{effectiveVoicepack ? `生效：${effectiveVoicepack.voice_name}` : '生效：未分配'}</small>
+        <button className="test-button" disabled={!effectivePackageId} onClick={() => onTest(segment, effectivePackageId)}>
+          <Sparkles size={15} />
+          测试试听
+        </button>
       </div>
     </article>
   );
@@ -444,7 +479,6 @@ function loadWorkspace() {
     return {
       ...emptyWorkspace(),
       ...parsed,
-      voices: Array.isArray(parsed.voices) ? parsed.voices : [],
       characterVoiceMap: parsed.characterVoiceMap || {},
       segmentVoiceMap: parsed.segmentVoiceMap || {},
     };
@@ -489,18 +523,7 @@ function normalizeImportedWorkspace(payload) {
     sourceBook.characters = deriveCharactersFromChapters(sourceBook.chapters);
   }
 
-  const voices = Array.isArray(payload.voices)
-    ? payload.voices.map((voice, index) => ({
-        id: voice.id || createLocalId(`voice-${index + 1}`),
-        name: voice.name || `声音 ${index + 1}`,
-        note: voice.note || '',
-        sample_filename: voice.sample_filename || voice.filename || '',
-        sample_type: voice.sample_type || '',
-        sample_data_url: voice.sample_data_url || voice.data_url || '',
-        created_at: voice.created_at || now,
-      }))
-    : [];
-  const knownVoiceIds = new Set(voices.map((voice) => voice.id));
+  const knownVoiceIds = new Set();
   const characterVoiceMap = {};
   for (const character of sourceBook.characters) {
     const voiceId = character.default_voice_id || character.voice_id || '';
@@ -514,42 +537,43 @@ function normalizeImportedWorkspace(payload) {
     }
   }
 
-  return { sourceBook, voices, characterVoiceMap, segmentVoiceMap, importedAt: now, updatedAt: now };
+  return { sourceBook, characterVoiceMap, segmentVoiceMap, importedAt: now, updatedAt: now };
 }
 
-function buildPhase3Export(workspace) {
+function buildPhase3Export(workspace, voicepacks) {
   const book = workspace.sourceBook;
-  const voicesById = new Map(workspace.voices.map((voice) => [voice.id, voice]));
+  const voicepacksById = new Map(voicepacks.map((voicepack) => [voicepack.package_id, voicepack]));
   const characters = (book.characters || deriveCharactersFromChapters(book.chapters)).map((character) => {
-    const defaultVoiceId = workspace.characterVoiceMap[getCharacterKey(character)] || null;
+    const defaultVoicepackId = workspace.characterVoiceMap[getCharacterKey(character)] || null;
     return {
       ...character,
-      default_voice_id: defaultVoiceId,
-      default_voice_name: defaultVoiceId ? voicesById.get(defaultVoiceId)?.name || null : null,
+      default_voicepack_id: defaultVoicepackId,
+      default_voicepack_name: defaultVoicepackId ? voicepacksById.get(defaultVoicepackId)?.voice_name || null : null,
     };
   });
-  const characterVoiceByName = new Map(characters.map((character) => [character.name, character.default_voice_id]));
-  const characterVoiceById = new Map(characters.map((character) => [String(character.id), character.default_voice_id]));
+  const characterVoicepackByName = new Map(characters.map((character) => [character.name, character.default_voicepack_id]));
+  const characterVoicepackById = new Map(characters.map((character) => [String(character.id), character.default_voicepack_id]));
 
   return {
     ...book,
     phase: 'phase3_voice_assignment',
     export_version: 3,
     exported_at: new Date().toISOString(),
-    voices: workspace.voices,
+    voicepacks,
     characters,
     chapters: book.chapters.map((chapter) => ({
       ...chapter,
       segments: chapter.segments.map((segment) => {
-        const overrideVoiceId = workspace.segmentVoiceMap[getSegmentKey(segment)] || null;
-        const inheritedVoiceId = characterVoiceById.get(String(segment.character_id)) || characterVoiceByName.get(segment.character_name) || null;
-        const effectiveVoiceId = overrideVoiceId || inheritedVoiceId || null;
+        const overrideVoicepackId = workspace.segmentVoiceMap[getSegmentKey(segment)] || null;
+        const inheritedVoicepackId =
+          characterVoicepackById.get(String(segment.character_id)) || characterVoicepackByName.get(segment.character_name) || null;
+        const effectiveVoicepackId = overrideVoicepackId || inheritedVoicepackId || null;
         return {
           ...segment,
-          voice_id: overrideVoiceId,
-          voice_name: overrideVoiceId ? voicesById.get(overrideVoiceId)?.name || null : null,
-          effective_voice_id: effectiveVoiceId,
-          effective_voice_name: effectiveVoiceId ? voicesById.get(effectiveVoiceId)?.name || null : null,
+          voicepack_id: overrideVoicepackId,
+          voicepack_name: overrideVoicepackId ? voicepacksById.get(overrideVoicepackId)?.voice_name || null : null,
+          effective_voicepack_id: effectiveVoicepackId,
+          effective_voicepack_name: effectiveVoicepackId ? voicepacksById.get(effectiveVoicepackId)?.voice_name || null : null,
         };
       }),
     })),
@@ -586,35 +610,6 @@ function removeVoiceAssignments(map, voiceId) {
 
 function touch(workspace) {
   return { ...workspace, updatedAt: new Date().toISOString() };
-}
-
-function validateAudioFile(file) {
-  const extension = file.name.split('.').pop()?.toLowerCase() || '';
-  const validExtension = AUDIO_EXTENSIONS.includes(extension);
-  const validType = !file.type || AUDIO_TYPES.includes(file.type) || file.type.startsWith('audio/');
-  if (!validExtension || !validType) throw new Error('声音样本只支持 wav、mp3、m4a、flac、ogg');
-}
-
-function fileToDataUrl(file) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result || ''));
-    reader.onerror = () => reject(new Error('读取声音样本失败'));
-    reader.readAsDataURL(file);
-  });
-}
-
-function guessAudioType(filename) {
-  const extension = filename.split('.').pop()?.toLowerCase();
-  if (extension === 'mp3') return 'audio/mpeg';
-  if (extension === 'm4a') return 'audio/mp4';
-  if (extension === 'flac') return 'audio/flac';
-  if (extension === 'ogg') return 'audio/ogg';
-  return 'audio/wav';
-}
-
-function createLocalId(prefix) {
-  return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 function downloadJson(payload, filename) {

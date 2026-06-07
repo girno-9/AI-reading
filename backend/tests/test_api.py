@@ -1,5 +1,7 @@
 import os
 from pathlib import Path
+import json
+import shutil
 import zipfile
 from io import BytesIO
 
@@ -8,7 +10,7 @@ os.environ["DATABASE_URL"] = "sqlite:///:memory:"
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app.database import Base, engine  # noqa: E402
-from app.main import app  # noqa: E402
+from app.main import VOICEPACK_INBOX_DIR, VOICEPACKS_DIR, app, init_voicepack_dirs  # noqa: E402
 
 
 client = TestClient(app)
@@ -17,6 +19,10 @@ client = TestClient(app)
 def setup_function():
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
+    for path in (VOICEPACK_INBOX_DIR, VOICEPACKS_DIR):
+        if path.exists():
+            shutil.rmtree(path)
+    init_voicepack_dirs()
 
 
 def test_import_edit_and_rename_character():
@@ -389,6 +395,86 @@ def test_delete_top_character_reassigns_to_new_top_character():
     assert updated_segment["character_name"] == "旁白"
 
 
+def test_voicepack_inbox_empty_by_default():
+    response = client.get("/api/voicepacks/inbox")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_voicepack_inbox_scans_and_imports_valid_zip():
+    zip_path = VOICEPACK_INBOX_DIR / "hero.voicepack.zip"
+    zip_path.write_bytes(build_voicepack_zip())
+
+    inbox = client.get("/api/voicepacks/inbox")
+    assert inbox.status_code == 200
+    item = inbox.json()[0]
+    assert item["filename"] == "hero.voicepack.zip"
+    assert item["is_valid"] is True
+    assert item["character_name"] == "张三"
+    assert item["voice_name"] == "张三-青年男声"
+
+    imported = client.post("/api/voicepacks/import", json={"filename": "hero.voicepack.zip"})
+    assert imported.status_code == 200
+    detail = imported.json()
+    assert detail["package_id"].startswith("voicepack_")
+    assert detail["engine"] == "gpt-sovits"
+    assert detail["preview_urls"]
+    assert zip_path.exists()
+
+    listed = client.get("/api/voicepacks").json()
+    assert listed[0]["package_id"] == detail["package_id"]
+    assert listed[0]["supported_emotions"] == ["平静", "开心"]
+
+    preview = client.get(detail["preview_urls"][0])
+    assert preview.status_code == 200
+    assert preview.content == b"preview-audio"
+
+
+def test_voicepack_import_rejects_missing_manifest():
+    zip_path = VOICEPACK_INBOX_DIR / "broken.voicepack.zip"
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("samples/sample_001.wav", b"audio")
+        archive.writestr("models/gpt_sovits/model.pth", b"model")
+        archive.writestr("metadata/training_metadata.csv", "path,text\n")
+    zip_path.write_bytes(buffer.getvalue())
+
+    imported = client.post("/api/voicepacks/import", json={"filename": "broken.voicepack.zip"})
+
+    assert imported.status_code == 400
+    assert "manifest.json" in imported.json()["detail"]
+
+
+def test_voicepack_import_rejects_unsafe_zip_path():
+    zip_path = VOICEPACK_INBOX_DIR / "unsafe.voicepack.zip"
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(valid_voicepack_manifest(), ensure_ascii=False))
+        archive.writestr("samples/sample_001.wav", b"audio")
+        archive.writestr("models/gpt_sovits/model.pth", b"model")
+        archive.writestr("metadata/training_metadata.csv", "path,text\n")
+        archive.writestr("../evil.txt", "bad")
+    zip_path.write_bytes(buffer.getvalue())
+
+    imported = client.post("/api/voicepacks/import", json={"filename": "unsafe.voicepack.zip"})
+
+    assert imported.status_code == 400
+    assert "不安全路径" in imported.json()["detail"]
+
+
+def test_voicepack_delete_removes_imported_copy_only():
+    zip_path = VOICEPACK_INBOX_DIR / "delete-test.voicepack.zip"
+    zip_path.write_bytes(build_voicepack_zip())
+    package_id = client.post("/api/voicepacks/import", json={"filename": zip_path.name}).json()["package_id"]
+
+    deleted = client.delete(f"/api/voicepacks/{package_id}")
+
+    assert deleted.status_code == 200
+    assert zip_path.exists()
+    assert client.get("/api/voicepacks").json() == []
+
+
 def build_epub() -> bytes:
     buffer = BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -430,4 +516,36 @@ def build_epub() -> bytes:
 </html>""",
         )
         archive.writestr("OEBPS/images/pic.png", b"\x89PNG\r\n\x1a\n")
+    return buffer.getvalue()
+
+
+def valid_voicepack_manifest() -> dict:
+    return {
+        "package_type": "voice_workshop_character_package",
+        "export_version": 1,
+        "character_name": "张三",
+        "voice_name": "张三-青年男声",
+        "description": "清亮、语速中等，适合主角对白",
+        "supported_emotions": ["平静", "开心"],
+        "engine": "gpt-sovits",
+        "preview_audio_path": "previews/neutral.wav",
+        "voice_profile": {
+            "engine": "gpt-sovits",
+            "model_path": "models/gpt_sovits/model.pth",
+            "config_path": "models/gpt_sovits/config.json",
+            "reference_audio_path": "models/gpt_sovits/reference.wav",
+        },
+    }
+
+
+def build_voicepack_zip() -> bytes:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("manifest.json", json.dumps(valid_voicepack_manifest(), ensure_ascii=False))
+        archive.writestr("samples/sample_001.wav", b"sample-audio")
+        archive.writestr("previews/neutral.wav", b"preview-audio")
+        archive.writestr("models/gpt_sovits/model.pth", b"model")
+        archive.writestr("models/gpt_sovits/config.json", "{}")
+        archive.writestr("models/gpt_sovits/reference.wav", b"reference")
+        archive.writestr("metadata/training_metadata.csv", "path,text\nsamples/sample_001.wav,你好\n")
     return buffer.getvalue()

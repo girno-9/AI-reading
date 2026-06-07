@@ -4,8 +4,11 @@ import json
 import logging
 import mimetypes
 import shutil
+import zipfile
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,17 +35,28 @@ from app.schemas import (
     ImportBookRequest,
     SegmentResponse,
     SegmentUpdateRequest,
+    VoicepackDetail,
+    VoicepackImportRequest,
+    VoicepackInboxItem,
+    VoicepackSummary,
+    VoicepackTestRequest,
+    VoicepackTestResponse,
 )
 
 
 logger = logging.getLogger("ai_reading")
 ASSETS_DIR = DATA_DIR / "assets"
 ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+VOICEPACK_INBOX_DIR = DATA_DIR / "voicepack_inbox"
+VOICEPACKS_DIR = DATA_DIR / "voicepacks"
+VOICEPACK_REQUIRED_DIRS = ("models/", "samples/", "metadata/")
+VOICEPACK_AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".flac", ".ogg"}
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     init_db()
+    init_voicepack_dirs()
     yield
 
 
@@ -223,6 +237,94 @@ def clear_cache(db: Session = Depends(get_db)) -> dict[str, int]:
 
     logger.info("已清空缓存：books=%s assets=%s", deleted_books, ASSETS_DIR)
     return {"deleted_books": deleted_books}
+
+
+@app.get("/api/voicepacks/inbox", response_model=list[VoicepackInboxItem])
+def list_voicepack_inbox() -> list[VoicepackInboxItem]:
+    init_voicepack_dirs()
+    return [inspect_voicepack_zip(path) for path in sorted(VOICEPACK_INBOX_DIR.glob("*.voicepack.zip"))]
+
+
+@app.post("/api/voicepacks/import", response_model=VoicepackDetail)
+def import_voicepack(payload: VoicepackImportRequest) -> VoicepackDetail:
+    init_voicepack_dirs()
+    zip_path = resolve_inbox_voicepack(payload.filename)
+    try:
+        manifest, package_id = validate_voicepack_zip(zip_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    target_dir = VOICEPACKS_DIR / package_id
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True)
+
+    with zipfile.ZipFile(zip_path) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            member_name = normalize_zip_member(info.filename)
+            target_path = target_dir / member_name
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(info) as source, target_path.open("wb") as target:
+                shutil.copyfileobj(source, target)
+
+    import_info = {
+        "package_id": package_id,
+        "source_filename": zip_path.name,
+        "imported_at": datetime.now(UTC).isoformat(),
+    }
+    (target_dir / "import_info.json").write_text(json.dumps(import_info, ensure_ascii=False, indent=2), encoding="utf-8")
+    return serialize_voicepack_dir(target_dir)
+
+
+@app.get("/api/voicepacks", response_model=list[VoicepackSummary])
+def list_imported_voicepacks() -> list[VoicepackSummary]:
+    init_voicepack_dirs()
+    voicepacks: list[VoicepackSummary] = []
+    for path in sorted(VOICEPACKS_DIR.iterdir() if VOICEPACKS_DIR.exists() else []):
+        if not path.is_dir():
+            continue
+        try:
+            voicepacks.append(voicepack_detail_to_summary(serialize_voicepack_dir(path)))
+        except ValueError:
+            logger.warning("跳过无效声音包目录：%s", path)
+    return voicepacks
+
+
+@app.get("/api/voicepacks/{package_id}", response_model=VoicepackDetail)
+def get_voicepack(package_id: str) -> VoicepackDetail:
+    return serialize_voicepack_dir(resolve_imported_voicepack(package_id))
+
+
+@app.get("/api/voicepacks/{package_id}/files/{asset_path:path}")
+def get_voicepack_file(package_id: str, asset_path: str) -> Response:
+    voicepack_dir = resolve_imported_voicepack(package_id)
+    try:
+        clean_path = normalize_zip_member(asset_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    file_path = voicepack_dir / clean_path
+    if not file_path.is_file():
+        raise HTTPException(status_code=404, detail="声音包文件不存在")
+    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    return Response(content=file_path.read_bytes(), media_type=media_type)
+
+
+@app.delete("/api/voicepacks/{package_id}")
+def delete_voicepack(package_id: str) -> dict[str, str]:
+    voicepack_dir = resolve_imported_voicepack(package_id)
+    shutil.rmtree(voicepack_dir)
+    return {"deleted_package_id": package_id}
+
+
+@app.post("/api/voicepacks/{package_id}/test-synthesis", response_model=VoicepackTestResponse)
+def test_voicepack_synthesis(package_id: str, payload: VoicepackTestRequest) -> VoicepackTestResponse:
+    voicepack = serialize_voicepack_dir(resolve_imported_voicepack(package_id))
+    engine = voicepack.engine or "unknown"
+    return VoicepackTestResponse(
+        status="not_configured",
+        detail=f"已找到声音包“{voicepack.voice_name}”，但当前阶段只完成导入、绑定和测试占位；尚未配置 {engine} 本地推理环境。",
+    )
 
 
 @app.patch("/api/segments/{segment_id}", response_model=SegmentResponse)
@@ -1033,3 +1135,219 @@ def serialize_segment(segment: Segment) -> SegmentResponse:
         label=segment.label or "",
         is_spoken=bool(segment.is_spoken),
     )
+
+
+def init_voicepack_dirs() -> None:
+    VOICEPACK_INBOX_DIR.mkdir(parents=True, exist_ok=True)
+    VOICEPACKS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def resolve_inbox_voicepack(filename: str) -> Path:
+    name = Path(filename).name
+    if name != filename or not name.endswith(".voicepack.zip"):
+        raise HTTPException(status_code=400, detail="只能导入投递区里的 .voicepack.zip 文件")
+    path = VOICEPACK_INBOX_DIR / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="声音包 ZIP 不存在")
+    return path
+
+
+def resolve_imported_voicepack(package_id: str) -> Path:
+    if not is_safe_package_id(package_id):
+        raise HTTPException(status_code=400, detail="声音包 ID 不正确")
+    path = VOICEPACKS_DIR / package_id
+    if not path.is_dir():
+        raise HTTPException(status_code=404, detail="声音包不存在")
+    return path
+
+
+def is_safe_package_id(value: str) -> bool:
+    return bool(value) and all(char.isalnum() or char in "-_" for char in value)
+
+
+def inspect_voicepack_zip(path: Path) -> VoicepackInboxItem:
+    stat = path.stat()
+    try:
+        manifest, package_id = validate_voicepack_zip(path)
+        return VoicepackInboxItem(
+            filename=path.name,
+            size_bytes=stat.st_size,
+            modified_at=datetime.fromtimestamp(stat.st_mtime, UTC),
+            package_id=package_id,
+            character_name=get_manifest_text(manifest, "character_name", "未命名角色"),
+            voice_name=get_manifest_text(manifest, "voice_name", "未命名声音"),
+            engine=get_manifest_text(manifest, "engine", get_nested_manifest_text(manifest, ["voice_profile", "engine"], "")),
+            is_valid=True,
+        )
+    except ValueError as exc:
+        return VoicepackInboxItem(
+            filename=path.name,
+            size_bytes=stat.st_size,
+            modified_at=datetime.fromtimestamp(stat.st_mtime, UTC),
+            is_valid=False,
+            error=str(exc),
+        )
+
+
+def validate_voicepack_zip(path: Path) -> tuple[dict[str, Any], str]:
+    if not path.name.endswith(".voicepack.zip"):
+        raise ValueError("只支持 .voicepack.zip 文件")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = [normalize_zip_member(info.filename) for info in archive.infolist() if not info.is_dir()]
+            if "manifest.json" not in names:
+                raise ValueError("声音包缺少 manifest.json")
+            for required_dir in VOICEPACK_REQUIRED_DIRS:
+                if not any(name.startswith(required_dir) for name in names):
+                    raise ValueError(f"声音包缺少 {required_dir} 目录内容")
+            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest.json 必须是对象")
+            validate_manifest_paths(manifest)
+            package_id = build_voicepack_package_id(archive.read("manifest.json"), path)
+            return manifest, package_id
+    except zipfile.BadZipFile as exc:
+        raise ValueError("声音包 ZIP 格式不正确") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("manifest.json 格式不正确") from exc
+
+
+def normalize_zip_member(name: str) -> str:
+    normalized = name.replace("\\", "/").strip("/")
+    path = Path(normalized)
+    if (
+        not normalized
+        or Path(name).is_absolute()
+        or normalized.startswith("../")
+        or "/../" in normalized
+        or normalized == ".."
+        or any(part in {"", ".", ".."} for part in normalized.split("/"))
+    ):
+        raise ValueError(f"声音包包含不安全路径：{name}")
+    return normalized
+
+
+def validate_manifest_paths(value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, str) and manifest_value_looks_like_path(key, item):
+                normalize_zip_member(item)
+            else:
+                validate_manifest_paths(item)
+    elif isinstance(value, list):
+        for item in value:
+            validate_manifest_paths(item)
+
+
+def manifest_value_looks_like_path(key: str, value: str) -> bool:
+    lowered_key = key.lower()
+    lowered_value = value.lower().replace("\\", "/")
+    if lowered_value.startswith(("models/", "samples/", "metadata/", "previews/")):
+        return True
+    if any(token in lowered_key for token in ("path", "file", "audio", "model", "config")):
+        return "/" in value or "\\" in value or "." in Path(value).name
+    return False
+
+
+def build_voicepack_package_id(manifest_bytes: bytes, zip_path: Path) -> str:
+    digest = hashlib.sha256(manifest_bytes + zip_path.read_bytes()).hexdigest()[:16]
+    return f"voicepack_{digest}"
+
+
+def serialize_voicepack_dir(path: Path) -> VoicepackDetail:
+    manifest_path = path / "manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("声音包目录缺少 manifest.json")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    import_info = read_voicepack_import_info(path)
+    package_id = str(import_info.get("package_id") or path.name)
+    preview_paths = find_voicepack_preview_paths(path, manifest)
+    return VoicepackDetail(
+        package_id=package_id,
+        character_name=get_manifest_text(manifest, "character_name", "未命名角色"),
+        voice_name=get_manifest_text(manifest, "voice_name", "未命名声音"),
+        description=get_manifest_text(manifest, "description", ""),
+        engine=get_manifest_text(manifest, "engine", get_nested_manifest_text(manifest, ["voice_profile", "engine"], "")),
+        supported_emotions=get_manifest_list(manifest, "supported_emotions"),
+        imported_at=parse_optional_datetime(import_info.get("imported_at")),
+        source_filename=str(import_info.get("source_filename") or ""),
+        preview_urls=[f"/api/voicepacks/{package_id}/files/{item}" for item in preview_paths],
+        manifest=manifest,
+    )
+
+
+def read_voicepack_import_info(path: Path) -> dict[str, Any]:
+    info_path = path / "import_info.json"
+    if not info_path.is_file():
+        return {"package_id": path.name}
+    try:
+        data = json.loads(info_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {"package_id": path.name}
+    except json.JSONDecodeError:
+        return {"package_id": path.name}
+
+
+def voicepack_detail_to_summary(detail: VoicepackDetail) -> VoicepackSummary:
+    return VoicepackSummary(**detail.model_dump(exclude={"description", "manifest"}))
+
+
+def find_voicepack_preview_paths(base_dir: Path, manifest: dict[str, Any]) -> list[str]:
+    paths: list[str] = []
+    collect_manifest_preview_paths(manifest, paths)
+    previews_dir = base_dir / "previews"
+    if previews_dir.exists():
+        for item in sorted(previews_dir.rglob("*")):
+            if item.is_file() and item.suffix.lower() in VOICEPACK_AUDIO_EXTENSIONS:
+                paths.append(item.relative_to(base_dir).as_posix())
+    unique_paths: list[str] = []
+    for item in paths:
+        try:
+            clean = normalize_zip_member(item)
+        except ValueError:
+            continue
+        if clean not in unique_paths and (base_dir / clean).is_file():
+            unique_paths.append(clean)
+    return unique_paths
+
+
+def collect_manifest_preview_paths(value: Any, paths: list[str]) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if isinstance(item, str) and "preview" in key.lower():
+                paths.append(item)
+            else:
+                collect_manifest_preview_paths(item, paths)
+    elif isinstance(value, list):
+        for item in value:
+            collect_manifest_preview_paths(item, paths)
+
+
+def get_manifest_text(manifest: dict[str, Any], key: str, default: str) -> str:
+    value = manifest.get(key)
+    return str(value).strip() if value is not None and str(value).strip() else default
+
+
+def get_nested_manifest_text(manifest: dict[str, Any], keys: list[str], default: str) -> str:
+    value: Any = manifest
+    for key in keys:
+        if not isinstance(value, dict):
+            return default
+        value = value.get(key)
+    return str(value).strip() if value is not None and str(value).strip() else default
+
+
+def get_manifest_list(manifest: dict[str, Any], key: str) -> list[str]:
+    value = manifest.get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def parse_optional_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+    except ValueError:
+        return None
